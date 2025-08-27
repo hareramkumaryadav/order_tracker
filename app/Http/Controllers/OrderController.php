@@ -17,75 +17,86 @@ use Illuminate\Http\Request;
 class OrderController extends Controller
 {
     public function store(StoreOrderRequest $request)
-    {
-        $payload = $request->validated();
+{
+    $payload = $request->validated();
 
-        // fetch products in one query and index by id for easy lookup
-        $productIds = collect($payload['items'])->pluck('product_id')->unique()->values()->all();
-        $products = Product::whereIn('id', $productIds)->get()->keyBy('id');
+    // fetch products in one query and index by id for easy lookup
+    $productIds = collect($payload['items'])->pluck('product_id')->unique()->values()->all();
+    $products = Product::whereIn('id', $productIds)->get()->keyBy('id');
 
-        try {
-            $order = DB::transaction(function () use ($payload, $products) {
-                // create base order with total 0 (we will update later)
-                $order = Order::create([
-                    'user_id' => $payload['user_id'],
-                    'total' => 0,
-                    'status' => 'pending',
-                ]);
+    try {
+        $order = DB::transaction(function () use ($payload, $products) {
+            $now = now();
+            $insert = [];
+            $total = 0;
 
-                $now = now();
-                $insert = [];
-                $total = 0;
-
-
-                foreach ($payload['items'] as $item) {
-                    $product = $products->get($item['product_id']);
-                    if (! $product) {
-                        throw new \Exception('Product not found: ' . $item['product_id']);
-                    }
-                    if ($product->price <= 0) {
-                        throw new \Exception('Invalid product price for product: ' . $product->id);
-                    }
-                    if (! isset($item['quantity']) || ! is_numeric($item['quantity']) || $item['quantity'] <= 0) {
-                        throw new \Exception('Invalid quantity for product: ' . $product->id);
-                    }
-                    $quantity = (int) $item['quantity'];
-                    $unitPrice = (float) $product->price;
-                    $lineTotal = round($unitPrice * $quantity, 2);
-
-
-                    $insert[] = [
-                        'order_id' => $order->id,
-                        'product_id' => $product->id,
-                        'quantity' => $quantity,
-                        'unit_price' => $unitPrice,
-                        'line_total' => $lineTotal,
-                        'created_at' => $now,
-                        'updated_at' => $now,
-                    ];
-
-
-                    $total += $lineTotal;
+            //  check stock before creating order
+            foreach ($payload['items'] as $item) {
+                $product = $products->get($item['product_id']);
+                if (! $product) {
+                    throw new \Exception("Product not found: {$item['product_id']}");
+                }
+                if ($product->price <= 0) {
+                    throw new \Exception("Invalid product price for product: {$product->id}");
                 }
 
-                // bulk insert
-                OrderItem::insert($insert);
-                // update order total
-                $order->total = round($total, 2);
-                $order->save();
+                
+                $quantity = (int) $item['quantity'];
 
+                if ($product->stock < $quantity) {
+                    throw new \Exception("Not enough stock for product: {$product->id}");
+                }
 
-                return $order;
-            }, 5); // 5 attempts for deadlock retry
+                $unitPrice = (float) $product->price;
+                $lineTotal = round($unitPrice * $quantity, 2);
 
-            // dispatch processing job after commit 
-            ProcessOrder::dispatch($order)->afterCommit();
-            return response()->json(['status' => true, 'order_id' => $order->id], 201);
-        } catch (\Throwable $e) {
-            Log::error('Order creation failed', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
-            return response()->json(['status' => false, 'message' => 'Order creation failed', 'error' => $e->getMessage()], 500);
-        }
+                $insert[] = [
+                    'product_id' => $product->id,
+                    'quantity'   => $quantity,
+                    'unit_price' => $unitPrice,
+                    'line_total' => $lineTotal,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ];
+
+                $total += $lineTotal;
+            }
+
+            //  only create order if all items are valid
+            $order = Order::create([
+                'user_id' => $payload['user_id'],
+                'total'   => round($total, 2),
+                'status'  => 'pending',
+            ]);
+
+            // attach order_id after creating order
+            foreach ($insert as &$row) {
+                $row['order_id'] = $order->id;
+            }
+
+            // bulk insert items
+            OrderItem::insert($insert);
+
+            return $order;
+        }, 5);
+
+        // dispatch processing job after commit 
+        ProcessOrder::dispatch($order)->afterCommit();
+
+        return response()->json(['status' => true, 'order_id' => $order->id], 201);
+    } catch (\Throwable $e) {
+        Log::error('Order creation failed', [
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString(),
+        ]);
+
+        return response()->json([
+            'status' => false,
+            'message' => 'Order creation failed',
+            'error' => $e->getMessage(),
+        ], 400); 
     }
+}
 
     /**
      * Display all orders with user & items.
